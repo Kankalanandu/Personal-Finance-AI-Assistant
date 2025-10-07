@@ -17,9 +17,11 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
 CORS(app)
+
 login_manager = LoginManager(app)
 login_manager.login_view = 'login_form'
 
+# Database Models
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(128), nullable=False)
@@ -53,163 +55,212 @@ class Badge(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
     name = db.Column(db.String(128), nullable=False)
     description = db.Column(db.String(256))
-    achieved_on = db.Column(db.Date, default=datetime.utcnow)
+    earned_date = db.Column(db.Date, default=datetime.utcnow)
+
+# Create tables globally for cloud deployment
+with app.app_context():
+    db.create_all()
 
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
 
-@app.route('/register_form', methods=['GET', 'POST'])
-def register_form():
+@app.route('/')
+def home():
+    return render_template('home.html')
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
     if request.method == 'POST':
         name = request.form['name']
         email = request.form['email']
         password = request.form['password']
+        
         if User.query.filter_by(email=email).first():
-            flash('Email already registered')
-            return render_template('register.html')
-        user = User(
-            name=name,
-            email=email,
-            password_hash=generate_password_hash(password)
-        )
-        db.session.add(user)
+            flash('Email already exists!')
+            return redirect(url_for('register'))
+        
+        password_hash = generate_password_hash(password)
+        new_user = User(name=name, email=email, password_hash=password_hash)
+        
+        db.session.add(new_user)
         db.session.commit()
-        flash('Registered successfully!')
-        return redirect('/login_form')
+        
+        flash('Registration successful!')
+        return redirect(url_for('login_form'))
+    
     return render_template('register.html')
 
-@app.route('/login_form', methods=['GET', 'POST'])
+@app.route('/login', methods=['GET', 'POST'])
 def login_form():
     if request.method == 'POST':
         email = request.form['email']
         password = request.form['password']
+        
         user = User.query.filter_by(email=email).first()
+        
         if user and check_password_hash(user.password_hash, password):
             login_user(user)
-            return redirect('/dashboard')
-        flash('Invalid credentials')
-        return render_template('login.html')
+            return redirect(url_for('dashboard'))
+        else:
+            flash('Invalid email or password!')
+    
     return render_template('login.html')
 
-@app.route('/logout', methods=['GET'])
+@app.route('/logout')
 @login_required
 def logout():
     logout_user()
-    flash("Successfully logged out!")
-    return redirect('/login_form')
-
-@app.route('/')
-def index():
-    return redirect('/dashboard')
-
-def get_smart_tips(user_id):
-    expenses = db.session.query(db.func.sum(Transaction.amount)).filter_by(user_id=user_id, transaction_type='expense').scalar() or 0
-    income = db.session.query(db.func.sum(Transaction.amount)).filter_by(user_id=user_id, transaction_type='income').scalar() or 0
-    budgets = Budget.query.filter_by(user_id=user_id).all()
-    tips = []
-    for b in budgets:
-        spent = db.session.query(db.func.sum(Transaction.amount)).filter_by(user_id=user_id, transaction_type='expense', category=b.category).scalar() or 0
-        if spent > b.limit:
-            tips.append(f"Exceeded '{b.category}' budget by ₹{int(spent-b.limit)}.")
-        elif spent > 0.85 * b.limit:
-            tips.append(f"Close to '{b.category}' budget limit! Caution advised.")
-    if income > 0 and expenses/income < 0.5:
-        tips.append("Saving over 50% of income—great job!")
-    elif income > 0 and expenses/income > 0.85:
-        tips.append("Spending more than 85% of income. Time to reduce expenses.")
-    advice_list = [
-        "Automate your savings for consistency.",
-        "Review subscriptions and cancel unused ones.",
-        "Track small expenses—they add up fast.",
-        "Set clear savings goals for the next quarter.",
-        "Build an emergency fund for unplanned costs."
-    ]
-    tips.append(random.choice(advice_list))
-    return tips
+    return redirect(url_for('home'))
 
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    expenses = db.session.query(db.func.sum(Transaction.amount)).filter_by(
-        user_id=current_user.id, transaction_type='expense').scalar() or 0
-    income = db.session.query(db.func.sum(Transaction.amount)).filter_by(
-        user_id=current_user.id, transaction_type='income').scalar() or 0
-    balance = income - expenses
+    transactions = Transaction.query.filter_by(user_id=current_user.id).all()
     budgets = Budget.query.filter_by(user_id=current_user.id).all()
-    category_data = db.session.query(Transaction.category, db.func.sum(Transaction.amount)).filter_by(
-        user_id=current_user.id, transaction_type='expense').group_by(Transaction.category).all()
-    categories = [cd[0] for cd in category_data]
-    amounts = [float(cd[1]) for cd in category_data]
-    smart_tips = get_smart_tips(current_user.id)
-    return render_template(
-        'dashboard.html',
-        income=income, expenses=expenses,
-        balance=balance, budgets=budgets,
-        categories=categories, amounts=amounts,
-        smart_tips=smart_tips
-    )
+    goals = Goal.query.filter_by(user_id=current_user.id).all()
+    
+    # Calculate totals
+    total_income = sum(t.amount for t in transactions if t.transaction_type == 'income')
+    total_expenses = sum(t.amount for t in transactions if t.transaction_type == 'expense')
+    balance = total_income - total_expenses
+    
+    return render_template('dashboard.html', 
+                         transactions=transactions[:5],  # Show last 5 transactions
+                         budgets=budgets,
+                         goals=goals,
+                         balance=balance,
+                         total_income=total_income,
+                         total_expenses=total_expenses)
 
-@app.route('/add_budget_form', methods=['GET', 'POST'])
+@app.route('/add_transaction', methods=['GET', 'POST'])
 @login_required
-def add_budget_form():
+def add_transaction():
+    if request.method == 'POST':
+        amount = float(request.form['amount'])
+        category = request.form['category']
+        description = request.form['description']
+        transaction_type = request.form['type']
+        
+        new_transaction = Transaction(
+            user_id=current_user.id,
+            amount=amount,
+            category=category,
+            description=description,
+            transaction_type=transaction_type
+        )
+        
+        db.session.add(new_transaction)
+        db.session.commit()
+        
+        # Check for achievements
+        check_achievements(current_user.id)
+        
+        flash('Transaction added successfully!')
+        return redirect(url_for('dashboard'))
+    
+    return render_template('add_transaction.html')
+
+@app.route('/transactions')
+@login_required
+def transactions():
+    user_transactions = Transaction.query.filter_by(user_id=current_user.id).all()
+    return render_template('transactions.html', transactions=user_transactions)
+
+@app.route('/set_budget', methods=['GET', 'POST'])
+@login_required
+def set_budget():
     if request.method == 'POST':
         category = request.form['category']
         limit = float(request.form['limit'])
-        b = Budget(user_id=current_user.id, category=category, limit=limit)
-        db.session.add(b)
+        
+        # Check if budget for this category already exists
+        existing_budget = Budget.query.filter_by(user_id=current_user.id, category=category).first()
+        if existing_budget:
+            existing_budget.limit = limit
+        else:
+            new_budget = Budget(user_id=current_user.id, category=category, limit=limit)
+            db.session.add(new_budget)
+        
         db.session.commit()
-        return redirect('/add_budget_form')
-    budgets = Budget.query.filter_by(user_id=current_user.id).all()
-    return render_template('budget.html', budgets=budgets)
+        flash('Budget updated successfully!')
+        return redirect(url_for('budgets'))
+    
+    return render_template('set_budget.html')
 
-@app.route('/goals', methods=['GET', 'POST'])
+@app.route('/budgets')
 @login_required
-def manage_goals():
+def budgets():
+    user_budgets = Budget.query.filter_by(user_id=current_user.id).all()
+    
+    # Calculate spending for each budget
+    budget_data = []
+    for budget in user_budgets:
+        spent = sum(t.amount for t in Transaction.query.filter_by(
+            user_id=current_user.id, 
+            category=budget.category, 
+            transaction_type='expense'
+        ).all())
+        
+        budget_data.append({
+            'budget': budget,
+            'spent': spent,
+            'remaining': budget.limit - spent,
+            'percentage': (spent / budget.limit * 100) if budget.limit > 0 else 0
+        })
+    
+    return render_template('budgets.html', budget_data=budget_data)
+
+@app.route('/set_goal', methods=['GET', 'POST'])
+@login_required
+def set_goal():
     if request.method == 'POST':
         name = request.form['name']
         target_amount = float(request.form['target_amount'])
-        deadline = datetime.strptime(request.form['deadline'], "%Y-%m-%d").date()
-        goal = Goal(user_id=current_user.id, name=name, target_amount=target_amount, deadline=deadline)
-        db.session.add(goal)
+        deadline = datetime.strptime(request.form['deadline'], '%Y-%m-%d').date()
+        
+        new_goal = Goal(user_id=current_user.id, name=name, target_amount=target_amount, deadline=deadline)
+        db.session.add(new_goal)
         db.session.commit()
-        return redirect('/goals')
-    goals = Goal.query.filter_by(user_id=current_user.id).all()
-    this_year = datetime.now().year
-    yearly_income = db.session.query(db.func.sum(Transaction.amount)).filter(
-        Transaction.user_id == current_user.id,
-        Transaction.transaction_type == 'income',
-        db.extract('year', Transaction.date) == this_year
-    ).scalar() or 0
-    yearly_expenses = db.session.query(db.func.sum(Transaction.amount)).filter(
-        Transaction.user_id == current_user.id,
-        Transaction.transaction_type == 'expense',
-        db.extract('year', Transaction.date) == this_year
-    ).scalar() or 0
-    savings = yearly_income - yearly_expenses
-    for goal in goals:
-        goal.progress = min(100, int((savings / goal.target_amount) * 100))
-    return render_template('goals.html', goals=goals)
+        
+        flash('Goal set successfully!')
+        return redirect(url_for('goals'))
+    
+    return render_template('set_goal.html')
 
-def assign_badges(user_id):
-    total_savings = (db.session.query(db.func.sum(Transaction.amount)).filter_by(
-        user_id=user_id, transaction_type='income').scalar() or 0) - \
-        (db.session.query(db.func.sum(Transaction.amount)).filter_by(
-        user_id=user_id, transaction_type='expense').scalar() or 0)
-    if total_savings > 100000 and not Badge.query.filter_by(user_id=user_id, name='Savings Superstar').first():
-        badge = Badge(user_id=user_id, name="Savings Superstar",
-            description="Saved over ₹100,000!", achieved_on=datetime.utcnow())
-        db.session.add(badge)
-        db.session.commit()
-
-@app.route('/badges')
+@app.route('/goals')
 @login_required
-def show_badges():
-    assign_badges(current_user.id)
-    badges = Badge.query.filter_by(user_id=current_user.id).all()
-    return render_template('badges.html', badges=badges)
+def goals():
+    user_goals = Goal.query.filter_by(user_id=current_user.id).all()
+    return render_template('goals.html', goals=user_goals)
+
+@app.route('/achievements')
+@login_required
+def achievements():
+    user_badges = Badge.query.filter_by(user_id=current_user.id).all()
+    return render_template('achievements.html', badges=user_badges)
+
+def check_achievements(user_id):
+    user = User.query.get(user_id)
+    transactions = Transaction.query.filter_by(user_id=user_id).all()
+    
+    # First transaction badge
+    if len(transactions) == 1 and not Badge.query.filter_by(user_id=user_id, name='First Step').first():
+        badge = Badge(user_id=user_id, name='First Step', description='Added your first transaction')
+        db.session.add(badge)
+    
+    # 10 transactions badge
+    if len(transactions) >= 10 and not Badge.query.filter_by(user_id=user_id, name='Getting Started').first():
+        badge = Badge(user_id=user_id, name='Getting Started', description='Added 10 transactions')
+        db.session.add(badge)
+    
+    # Budget setter badge
+    budgets = Budget.query.filter_by(user_id=user_id).all()
+    if len(budgets) >= 1 and not Badge.query.filter_by(user_id=user_id, name='Budget Planner').first():
+        badge = Badge(user_id=user_id, name='Budget Planner', description='Set your first budget')
+        db.session.add(badge)
+    
+    db.session.commit()
 
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
     app.run(debug=True)
